@@ -2378,21 +2378,20 @@ async def test_redis_caching_llm_caching_ttl(sync_mode):
                 name="test", value='"test_value"', ex=120, nx=False
             )
 
-    ## Increment cache
+    ## Increment cache - increment + expiry ship as one script, not INCR/TTL/EXPIRE
     if sync_mode is True:
-        with patch.object(cache_obj.redis_client, "ttl") as mock_incr:
+        with patch.object(cache_obj.redis_client, "eval", return_value=b"1") as mock_eval:
             cache_obj.increment_cache(key="test", value=1)
-            mock_incr.assert_called_once_with("test")
+            assert mock_eval.call_args.args[2] == "test"
     else:
         # Patch self.init_async_client to return our mock Redis client
+        mock_redis_instance.eval = AsyncMock(return_value=b"1")
         with patch.object(
             cache_obj, "init_async_client", return_value=mock_redis_instance
         ):
-            # Call async_set_cache
-            await cache_obj.async_increment(key="test", value="test_value")
+            await cache_obj.async_increment(key="test", value=1)
 
-            # Verify that the set method was called on the mock Redis instance
-            mock_redis_instance.ttl.assert_called_once_with("test")
+            assert mock_redis_instance.eval.call_args.args[2] == "test"
 
 
 @pytest.mark.asyncio()

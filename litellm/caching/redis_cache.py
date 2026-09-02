@@ -78,6 +78,23 @@ class _AsyncRedisCommands(Protocol):
     def pipeline(self, transaction: bool = True) -> "Pipeline[bytes]": ...
 
 
+# KEYS[1] counter, ARGV[1] amount, ARGV[2] ttl seconds ("" for none),
+# ARGV[3] "1" refreshes an existing ttl, "0" only sets one when absent.
+_INCREMENT_AND_EXPIRE_LUA: Final = (
+    "local value = redis.call('{command}', KEYS[1], ARGV[1]) "
+    "if ARGV[2] ~= '' and (ARGV[3] == '1' or redis.call('TTL', KEYS[1]) == -1) then "
+    "redis.call('EXPIRE', KEYS[1], ARGV[2]) "
+    "end "
+    "return tostring(value)"
+)
+_INCRBY_AND_EXPIRE_LUA: Final = _INCREMENT_AND_EXPIRE_LUA.format(command="INCRBY")
+_INCRBYFLOAT_AND_EXPIRE_LUA: Final = _INCREMENT_AND_EXPIRE_LUA.format(command="INCRBYFLOAT")
+
+
+def _decode_lua_number(result: bytes | str | float) -> str:
+    return result.decode() if isinstance(result, bytes) else str(result)
+
+
 def _get_call_stack_info(num_frames: int = 2) -> str:
     """
     Get the function names from the previous 1-2 functions in the call stack.
@@ -519,7 +536,18 @@ class RedisCache(BaseCache):
         key = self.check_and_fix_namespace(key=key)
         try:
             start_time = time.time()
-            result: Final[int] = _redis_client.incr(name=key, amount=value)
+            result: Final[int] = int(
+                _decode_lua_number(
+                    _redis_client.eval(
+                        _INCRBY_AND_EXPIRE_LUA,
+                        1,
+                        key,
+                        str(value),
+                        "" if set_ttl is None else str(set_ttl),
+                        "0",
+                    )
+                )
+            )
             end_time = time.time()
             _duration = end_time - start_time
             self.service_logger_obj.service_success_hook(
@@ -529,33 +557,6 @@ class RedisCache(BaseCache):
                 start_time=start_time,
                 end_time=end_time,
             )
-
-            if set_ttl is not None:
-                # check if key already has ttl, if not -> set ttl
-                start_time = time.time()
-                current_ttl: Final = _redis_client.ttl(key)
-                end_time = time.time()
-                _duration = end_time - start_time
-                self.service_logger_obj.service_success_hook(
-                    service=ServiceTypes.REDIS,
-                    duration=_duration,
-                    call_type=f"increment_cache_ttl <- {_get_call_stack_info()}",
-                    start_time=start_time,
-                    end_time=end_time,
-                )
-                if current_ttl == -1:
-                    # Key has no expiration
-                    start_time = time.time()
-                    _redis_client.expire(key, set_ttl)
-                    end_time = time.time()
-                    _duration = end_time - start_time
-                    self.service_logger_obj.service_success_hook(
-                        service=ServiceTypes.REDIS,
-                        duration=_duration,
-                        call_type=f"increment_cache_expire <- {_get_call_stack_info()}",
-                        start_time=start_time,
-                        end_time=end_time,
-                    )
             return result
         except Exception as e:
             ## LOGGING ##
@@ -990,14 +991,18 @@ class RedisCache(BaseCache):
         _used_ttl: Final = self.get_ttl(ttl=ttl)
         key = self.check_and_fix_namespace(key=key)
         try:
-            result: Final = await _redis_client.incrbyfloat(name=key, amount=value)
-            if _used_ttl is not None:
-                if refresh_ttl:
-                    await _redis_client.expire(key, _used_ttl)
-                else:
-                    current_ttl: Final = await _redis_client.ttl(key)
-                    if current_ttl == -1:
-                        await _redis_client.expire(key, _used_ttl)
+            result: Final = float(
+                _decode_lua_number(
+                    await _redis_client.eval(
+                        _INCRBYFLOAT_AND_EXPIRE_LUA,
+                        1,
+                        key,
+                        str(value),
+                        "" if _used_ttl is None else str(_used_ttl),
+                        "1" if refresh_ttl else "0",
+                    )
+                )
+            )
 
             ## LOGGING ##
             end_time = time.time()
@@ -1449,21 +1454,24 @@ class RedisCache(BaseCache):
         increment_list: list[RedisPipelineIncrementOperation],
     ) -> list[float] | None:
         """Helper function for pipeline increment operations"""
-        # Iterate through each increment operation and add commands to pipeline
         for increment_op in increment_list:
             cache_key = self.check_and_fix_namespace(key=increment_op["key"])
+            increment_ttl = increment_op["ttl"]
             print_verbose(
-                f"Increment ASYNC Redis Cache PIPELINE: key: {cache_key}\nValue {increment_op['increment_value']}\nttl={increment_op['ttl']}"
+                f"Increment ASYNC Redis Cache PIPELINE: key: {cache_key}\nValue {increment_op['increment_value']}\nttl={increment_ttl}"
             )
-            pipe.incrbyfloat(cache_key, increment_op["increment_value"])
-            if increment_op["ttl"] is not None:
-                _td = timedelta(seconds=increment_op["ttl"])
-                pipe.expire(cache_key, _td)
+            pipe.eval(
+                _INCRBYFLOAT_AND_EXPIRE_LUA,
+                1,
+                cache_key,
+                str(increment_op["increment_value"]),
+                "" if increment_ttl is None else str(int(increment_ttl)),
+                "1",
+            )
         # Execute the pipeline and return results
         results: Final = await pipe.execute()
-        # only return float values
         verbose_logger.debug("Increment ASYNC Redis Cache PIPELINE: results: %s", results)
-        return [r for r in results if isinstance(r, float)]
+        return [float(_decode_lua_number(r)) for r in results]
 
     @_redis_circuit_breaker_guard
     async def async_increment_pipeline(

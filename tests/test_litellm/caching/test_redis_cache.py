@@ -448,11 +448,13 @@ def test_increment_cache_namespaces_key(
     monkeypatch.setenv("REDIS_HOST", "https://my-test-host")
     redis_cache = RedisCache(namespace=namespace)
     mock_client = MagicMock()
-    mock_client.incr.return_value = 5
-    mock_client.ttl.return_value = 100
+    mock_client.eval.return_value = b"5"
     redis_cache.redis_client = mock_client
     redis_cache.increment_cache(key="k", value=1)
-    mock_client.incr.assert_called_once_with(name=expected, amount=1)
+    # increment + expiry go out as a single script, keyed on the namespaced key
+    assert mock_client.eval.call_count == 1
+    args = mock_client.eval.call_args.args
+    assert args[1] == 1 and args[2] == expected
 
 
 @pytest.mark.parametrize("namespace, expected", [(None, "k"), ("ns", "ns:k")])
@@ -633,3 +635,146 @@ async def test_only_connectivity_failures_open_the_breaker(error, opens_breaker)
         await _run_under_circuit_breaker(breaker, "op", failing_call)
 
     assert breaker.is_open() is opens_breaker
+
+
+class _CountingRedis:
+    """Async redis double that records the commands it is asked to run.
+
+    Only ``eval`` mutates state: a counter incremented by anything other than a
+    single atomic call is, by construction, interruptible between commands.
+    """
+
+    def __init__(self):
+        self.store: dict[str, float] = {}
+        self.ttls: dict[str, int] = {}
+        self.commands: list[str] = []
+
+    async def incrbyfloat(self, name, amount):  # pragma: no cover - must not be reached
+        self.commands.append("INCRBYFLOAT")
+        raise AssertionError("increment must not issue a standalone INCRBYFLOAT")
+
+    async def ttl(self, key):  # pragma: no cover - must not be reached
+        self.commands.append("TTL")
+        raise AssertionError("increment must not issue a standalone TTL")
+
+    async def expire(self, key, ttl):  # pragma: no cover - must not be reached
+        self.commands.append("EXPIRE")
+        raise AssertionError("increment must not issue a standalone EXPIRE")
+
+    async def eval(self, script, numkeys, key, amount, ttl, refresh):
+        self.commands.append("EVAL")
+        self.store[key] = self.store.get(key, 0.0) + float(amount)
+        if ttl != "" and (refresh == "1" or key not in self.ttls):
+            self.ttls[key] = int(ttl)
+        return str(self.store[key]).encode()
+
+
+def _mute_service_logger(cache: RedisCache) -> None:
+    cache.service_logger_obj = MagicMock(
+        async_service_success_hook=AsyncMock(), async_service_failure_hook=AsyncMock()
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_increment_sets_expiry_in_the_same_command(monkeypatch, redis_no_ping):
+    """A counter and its expiry must be created together.
+
+    Splitting this into INCRBYFLOAT -> TTL -> EXPIRE lets a dropped connection or
+    a Sentinel master promotion land between the commands, leaving the counter
+    behind at TTL=-1. Rate-limit windows are keyed by wall-clock minute, so such
+    a key is read again at that same minute on every later day and saturates the
+    window permanently.
+    """
+    monkeypatch.setenv("REDIS_HOST", "https://my-test-host")
+    cache = RedisCache()
+    _mute_service_logger(cache)
+    fake = _CountingRedis()
+
+    with patch.object(cache, "init_async_client", return_value=fake):
+        result = await cache.async_increment("model:rpm:14-30", 1.0, ttl=60)
+
+    assert result == 1.0
+    assert fake.commands == ["EVAL"]
+    assert fake.ttls["model:rpm:14-30"] == 60
+
+
+@pytest.mark.asyncio
+async def test_async_increment_does_not_refresh_an_existing_ttl(monkeypatch, redis_no_ping):
+    """Fixed windows must keep their original deadline across increments."""
+    monkeypatch.setenv("REDIS_HOST", "https://my-test-host")
+    cache = RedisCache()
+    _mute_service_logger(cache)
+    fake = _CountingRedis()
+
+    with patch.object(cache, "init_async_client", return_value=fake):
+        await cache.async_increment("k", 1.0, ttl=60)
+        fake.ttls["k"] = 5  # window is nearly over
+        await cache.async_increment("k", 1.0, ttl=60)
+        assert fake.ttls["k"] == 5
+
+        # ...unless the caller explicitly asks for a sliding window
+        await cache.async_increment("k", 1.0, ttl=60, refresh_ttl=True)
+        assert fake.ttls["k"] == 60
+
+
+@pytest.mark.asyncio
+async def test_async_increment_pipeline_expires_every_key(monkeypatch, redis_no_ping):
+    """The pipeline runs with transaction=False, so per-key atomicity has to come
+    from the script itself -- a failover part-way through the pipeline must not
+    strand any counter without an expiry."""
+    monkeypatch.setenv("REDIS_HOST", "https://my-test-host")
+    cache = RedisCache()
+    _mute_service_logger(cache)
+    fake = _CountingRedis()
+    fake.pipeline = lambda transaction=True: _FakePipeline(fake)
+
+    with patch.object(cache, "init_async_client", return_value=fake):
+        results = await cache.async_increment_pipeline(
+            [
+                {"key": "p1", "increment_value": 1.5, "ttl": 60},
+                {"key": "p1", "increment_value": 1.5, "ttl": 60},
+                {"key": "p2", "increment_value": 2.5, "ttl": 30},
+            ]
+        )
+
+    assert results == [1.5, 3.0, 2.5]
+    assert fake.ttls == {"p1": 60, "p2": 30}
+    assert fake.commands == ["EVAL", "EVAL", "EVAL"]
+
+
+class _FakePipeline:
+    def __init__(self, server):
+        self.server = server
+        self.queued = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def eval(self, *args):
+        self.queued.append(args)
+
+    async def execute(self):
+        return [await self.server.eval(*args) for args in self.queued]
+
+
+def test_increment_cache_sets_expiry_in_the_same_command(monkeypatch, redis_no_ping):
+    """Same guarantee on the sync path, which returns an int."""
+    monkeypatch.setenv("REDIS_HOST", "https://my-test-host")
+    cache = RedisCache()
+    cache.service_logger_obj = MagicMock()
+    client = MagicMock()
+    client.eval.return_value = b"7"
+    cache.redis_client = client
+
+    result = cache.increment_cache(key="k", value=7, ttl=60)
+
+    assert result == 7 and isinstance(result, int)
+    client.incr.assert_not_called()
+    client.expire.assert_not_called()
+    client.ttl.assert_not_called()
+    script, numkeys, key, amount, ttl, refresh = client.eval.call_args.args
+    assert "INCRBY" in script and "EXPIRE" in script
+    assert (numkeys, key, amount, ttl, refresh) == (1, "k", "7", "60", "0")
