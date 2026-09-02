@@ -534,3 +534,55 @@ def test_importing_caching_does_not_require_redis():
     )
     assert result.returncode == 0, result.stderr
     assert "ok" in result.stdout
+
+
+def test_imports_against_redis_py_6_module_layout():
+    # redis-py 6.0 renamed redis.commands.search.indexDefinition to
+    # index_definition and kept no camelCase alias, so importing the old path
+    # raised ModuleNotFoundError at module scope and crashed the proxy at
+    # startup for anyone on redis-py >= 6 with cache type "valkey-semantic".
+    # Runs in a subprocess so the blocked import cannot leak into this session.
+    code = textwrap.dedent("""
+        import sys, types
+
+        # Load redis for real first: redis.commands.search's own __init__ still
+        # imports the camelCase module on redis-py 5.x.
+        import redis.asyncio
+        import redis.commands.search.field
+        import redis.commands.search.query
+
+        parent = sys.modules["redis.commands.search"]
+        fake = types.ModuleType("redis.commands.search.index_definition")
+        class IndexDefinition: pass
+        class IndexType: pass
+        fake.IndexDefinition = IndexDefinition
+        fake.IndexType = IndexType
+        sys.modules["redis.commands.search.index_definition"] = fake
+        parent.index_definition = fake
+
+        class _NoCamelCaseModule:
+            def find_spec(self, name, path=None, target=None):
+                if name == "redis.commands.search.indexDefinition":
+                    raise ModuleNotFoundError(
+                        "No module named 'redis.commands.search.indexDefinition'",
+                        name=name,
+                    )
+                return None
+
+        sys.modules.pop("redis.commands.search.indexDefinition", None)
+        sys.meta_path.insert(0, _NoCamelCaseModule())
+
+        import litellm.caching.valkey_semantic_cache as vsc
+
+        assert vsc.IndexDefinition is IndexDefinition
+        assert vsc.IndexType is IndexType
+        print("ok")
+        """)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": _REPO_ROOT},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout
